@@ -1,4 +1,4 @@
-name: Deploy React App to WordPress
+name: Deploy WordPress and ReactPress
 
 on:
   push:
@@ -6,12 +6,61 @@ on:
       - main
 
 jobs:
-  build:
+  deploy:
     runs-on: ubuntu-latest
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v2
+
+    - name: Install AWS CLI
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y awscli
+
+    - name: Sync WordPress files to S3
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_REGION: ${{ secrets.AWS_REGION }}
+        S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+      run: |
+        aws s3 sync wordpress/ s3://$S3_BUCKET_NAME/
+
+    - name: Set up WordPress site
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_REGION: ${{ secrets.AWS_REGION }}
+        S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+      run: |
+        curl -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+        chmod +x wp-cli.phar
+        sudo mv wp-cli.phar /usr/local/bin/wp
+
+        # Define WordPress URL (S3 bucket static website URL)
+        WORDPRESS_URL="http://${S3_BUCKET_NAME}.s3-website-${AWS_REGION}.amazonaws.com"
+
+        # Set up WordPress
+        wp core install --url=$WORDPRESS_URL --title="My WordPress Site" --admin_user="admin" --admin_password="admin_password" --admin_email="admin@example.com"
+
+        # Check if ReactPress is installed, install if not
+        if ! wp plugin is-installed reactpress; then
+          wp plugin install reactpress --activate
+
+          # Create a sample page if ReactPress is installed for the first time
+          PAGE_TITLE="React App Page"
+          PAGE_ID=$(wp post create --post_type=page --post_title="$PAGE_TITLE" --post_status=publish --porcelain)
+
+          # Create a sample ReactPress page
+          echo "{
+            \"id\": \"$PAGE_ID\",
+            \"slug\": \"$PAGE_TITLE\",
+            \"content\": \"<div id='root'></div>\"
+          }" > reactpress.json
+
+          aws s3 cp reactpress.json s3://$S3_BUCKET_NAME/
+        fi
 
     - name: Set up Node.js
       uses: actions/setup-node@v2
@@ -29,15 +78,6 @@ jobs:
         cd react-app
         npm run build
 
-    - name: Upload WordPress to AWS S3
-      env:
-        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        AWS_REGION: ${{ secrets.AWS_REGION }}
-        S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
-      run: |
-        aws s3 sync wordpress/ s3://$S3_BUCKET_NAME/wordpress
-
     - name: Upload React build to AWS S3
       env:
         AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -50,50 +90,22 @@ jobs:
     - name: Deploy to WordPress
       env:
         WORDPRESS_URL: ${{ secrets.WORDPRESS_URL }}
-        WORDPRESS_USER: ${{ secrets.WORDPRESS_USER }}
-        WORDPRESS_PASSWORD: ${{ secrets.WORDPRESS_PASSWORD }}
+        WORDPRESS_USER: "admin"
+        WORDPRESS_PASSWORD: "admin_password"
         AWS_REGION: ${{ secrets.AWS_REGION }}
         S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
       run: |
-        # Install WP-CLI locally
-        curl -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
-        chmod +x wp-cli.phar
-        sudo mv wp-cli.phar /usr/local/bin/wp
-
-        # Define variables
-        PAGE_TITLE="React App Page"
-        PLUGIN_SLUG="reactpress"
-        PLUGIN_URL="https://downloads.wordpress.org/plugin/reactpress.latest-stable.zip"
-
         # Function to run WP-CLI commands remotely
         function wp_remote() {
           wp "$@" --url="${WORDPRESS_URL}" --user="${WORDPRESS_USER}" --prompt=password <<< $WORDPRESS_PASSWORD
         }
 
-        # Check if ReactPress is installed, install if not
-        if ! wp_remote plugin is-installed $PLUGIN_SLUG; then
-          wp_remote plugin install $PLUGIN_URL --activate
-
-          # Create a sample page if ReactPress is installed for the first time
-          PAGE_ID=$(wp_remote post create --post_type=page --post_title="$PAGE_TITLE" --post_status=publish --porcelain)
-          
-          # Clean up the current ReactPress project
-          wp_remote reactpress clean $PAGE_ID
-
-          # Sync the build files from S3
-          aws s3 sync s3://$S3_BUCKET_NAME/build /tmp/build
-          wp_remote reactpress deploy /tmp/build $PAGE_ID
-        else
-          # Check if the page exists, create if not
-          PAGE_ID=$(wp_remote post list --post_type=page --title="$PAGE_TITLE" --field=ID --format=ids)
-          if [ -z "$PAGE_ID" ]; then
-            PAGE_ID=$(wp_remote post create --post_type=page --post_title="$PAGE_TITLE" --post_status=publish --porcelain)
-          fi
-
-          # Clean up the current ReactPress project
-          wp_remote reactpress clean $PAGE_ID
-
-          # Sync the build files from S3
-          aws s3 sync s3://$S3_BUCKET_NAME/build /tmp/build
-          wp_remote reactpress deploy /tmp/build $PAGE_ID
+        # Deploy React build to WordPress using ReactPress
+        PAGE_ID=$(wp_remote post list --post_type=page --title="React App Page" --field=ID --format=ids)
+        if [ -z "$PAGE_ID" ]; then
+          PAGE_ID=$(wp_remote post create --post_type=page --post_title="React App Page" --post_status=publish --porcelain)
         fi
+
+        # Sync the build files from S3
+        aws s3 sync s3://$S3_BUCKET_NAME/build /tmp/build
+        wp_remote reactpress deploy /tmp/build $PAGE_ID
